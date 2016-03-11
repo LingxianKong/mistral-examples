@@ -1,0 +1,101 @@
+---
+version: '2.0'
+
+workflows:
+  clear_host:
+    type: direct
+
+    input:
+      - source_host: None
+
+    tasks:
+      get_vms:
+        action: nova.servers_list
+        input:
+          search_opts:
+            all_tenants: true
+        publish:
+          running_vm_ids: <% task(get_vms).result.where($.OS-EXT-SRV-ATTR:host = $.source_host and $.status = 'ACTIVE').select($.id) %>
+          stopped_vm_ids: <% task(get_vms).result.where($.OS-EXT-SRV-ATTR:host = $.source_host and $.status = 'SHUTOFF').select($.id) %>
+        on-success:
+          - live_migrate_vms
+          - migrate_vms
+
+      live_migrate_vms:
+        with-items: 
+          - vm_id in <% $.running_vm_ids %>
+        workflow: live_migrate_vm_wf vm_id=<% $.vm_id %> source_host=<% $.source_host %>
+        concurrency: 3
+
+      migrate_vms:
+        with-items:
+          - vm_id in <% $.stopped_vm_ids %>
+        workflow: migrate_vm_wf vm_id=<% $.vm_id %> source_host=<% $.source_host %>
+        concurrency: 3
+
+  live_migrate_vm_wf:
+    type: direct
+
+    input:
+      - vm_id: None
+      - source_host:None
+
+    tasks:
+      live_migrate_vm:
+        action: nova.servers_live_migrate server=<% $.vm_id %>
+        on-success:
+          - check_live_migration
+
+      check_live_migration:
+        action: nova.servers_find id=<% $.vm_id %>
+        publish: 
+          vm_host: <% task(check_live_migration).result.OS-EXT-SRV-ATTR:host %>
+          vm_status: <% task(check_live_migration).result.status %>
+        wait-before: 5
+        retry:
+          delay: 5
+          count: 20
+          continue-on: <% $.vm_host = $.source_host and $.vm_status != 'ERROR' %>
+        on-complete:
+          - fail: <% $.vm_status = 'ERROR' or $.vm_host = $.source_host %>
+          - succeed: <% $.vm_host != $.source_host %>
+
+  migrate_vm_wf:
+    type: direct
+
+    input:
+      - vm_id: None
+      - source_host:None
+
+    tasks:
+      migrate_vm:
+        action: nova.servers_migrate server=<% $.vm_id %>
+        on-success:
+          - check_migrate
+
+      check_migrate:
+        action: nova.servers_find id=<% $.vm_id %>
+        publish: 
+          vm_host: <% task(check_migrate).result.OS-EXT-SRV-ATTR:host %>
+          vm_status: <% task(check_migrate).result.status %>
+        wait-before: 5
+        retry:
+          delay: 5
+          count: 20
+          continue-on: <% $.vm_host = $.source_host and $.vm_status != 'ERROR' %>
+        on-complete:
+          - fail: <% $.vm_status = 'ERROR' or $.vm_host = $.source_host %>
+          - confirm_resize: <% $.vm_status = 'VERIFY_RESIZE' %>
+
+      confirm_resize:
+        action: nova.servers_confirm_resize server=<% $.vm_id %>
+        on-success:
+          - wait_to_active
+
+      wait_to_active:
+        action: nova.servers_find id=<% $.vm_id %> status='SHUTDOWN'
+        retry:
+          delay: 5
+          count: 3
+        on-error:
+          - fail
